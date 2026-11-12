@@ -135,6 +135,7 @@ extern id gNVMTLMainDevice;
   NSMutableArray *_handlers;
   NSMutableArray *_scratch;
   NSMutableSet *_resources;
+  NSMutableSet *_hostPublications; // owned managed staging: publish caller pages after this part finishes
   NSMutableSet *_surfDirty;
   NSMutableSet *_surfOverwrites; // contents defined by writes recorded in this command buffer
   unsigned _nEnc, _nEnd, _nHandlers, _nStatus, _nEnqueue, _nLabel, _nPresent, _nWait;
@@ -278,7 +279,7 @@ id<MTLCounterSet> nvmtl_timestamp_counter_set(void);
 @interface NVMTLBuffer () { @public NSString *_label; MTLResourceOptions _ropt;
   int _resRefs, _rstate, _lruReg, _wantOn; uint64_t _lastUse;
   uint64_t _useEp;
-  BOOL _texSeen;
+  BOOL _texSeen, _everGpuWritten;
 } @end
 @interface NVMTLTexture () { @public NSString *_label; MTLResourceOptions _ropt; BOOL _shareable; BOOL _fbo;
   MTLTextureSwizzleChannels _swz; BOOL _hasSwz; void *_swzView;
@@ -292,7 +293,9 @@ id<MTLCounterSet> nvmtl_timestamp_counter_set(void);
 } @end
 void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d);
 #include <os/lock.h>
-@interface NVMTLResSet : NSMutableSet { @public NSMutableSet *_s; os_unfair_lock _lk; const void *_mru[8]; unsigned _mruNext; }
+@interface NVMTLResSet : NSMutableSet { @public NSMutableSet *_s, *_w; os_unfair_lock _lk; const void *_mru[8]; unsigned _mruNext; }
+- (void)addReadOnlyObject:(id)o;
+- (BOOL)isWrittenObject:(id)o;
 - (NVMTLResSet *)nvmtlTakeAll;
 @end
 @interface NVMTLFunction () { @public NSString *_label; } @end
