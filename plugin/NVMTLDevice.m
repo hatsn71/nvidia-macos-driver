@@ -807,6 +807,47 @@ static uint64_t nvmtl_rt_gate_working_set(uint64_t ws)
     if (!said++) nvlog("working set: answered %lld MB instead of %llu MB while ray tracing is available (NVMTL_WS_RT_GATE_MB)", floor_mb, (unsigned long long)(ws >> 20));
     return (uint64_t)floor_mb << 20;
 }
+// A family-VRAM surface wrapper is re-made for every frame that composites it (a video ring, WindowServer's
+// per-frame layer wrappers) and the weak cache in newTextureWithDescriptor:iosurface:plane: cannot serve
+// those: its entry dies with the application's last wrapper, which a per-frame wrapper is not. A PIN holds
+// the backing texture strongly, so a re-wrap of the same surface takes a view of the pinned backing
+// instead of paying a full nvmtl_surface_image_create - above all its
+// vkCreateImage/vkBindImageMemory/vkCreateImageView, measured at ~17% of WindowServer's render thread
+// while a 1080p video played. Lifetime: the pinned backing keeps its import-cache slot checked out (it
+// never calls nvmtl_ic_put until it deallocs), so the slot cannot expire under the pin; every view
+// retains the backing through _parent, so the image cannot die under a live view. A surface id the
+// system reuses for a DIFFERENT surface is caught by the cookie the import cache stores on the surface
+// itself - a mismatched (or absent) cookie drops the pin. Surfaces outside the import cache carry no
+// cookie (0) and are never pinned. NVMTL_SURF_TEX_PIN=0 turns pins off.
+@interface NVMTLSurfTexPins : NSObject
+@end
+@interface NVMTLSurfTexPins ()
+@property (readonly) NSMapTable<NSNumber *, NVMTLTexture *> *backing;   // surface id -> pinned backing
+@property (readonly) NSMapTable<NSNumber *, NSNumber *> *cookie;        // surface id -> cookie the pin was taken under
+@property (readonly) NSMutableArray<NSNumber *> *lru;                   // least-recently-used first
+@end
+@implementation NVMTLSurfTexPins
+- (instancetype)init { if ((self = [super init])) { _backing = [NSMapTable strongToStrongObjectsMapTable];
+    _cookie = [NSMapTable strongToStrongObjectsMapTable]; _lru = [NSMutableArray array]; } return self; }
+@end
+static char nvmtl_surface_pins_key;
+static const NSUInteger NVMTL_SURF_TEX_PIN_MAX = 64;   // bounded; an evicted pin releases its import-cache slot
+static BOOL nvmtl_surf_tex_pins_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_SURF_TEX_PIN"); on = !(e && e[0] == '0');
+                  nvlog("surface texture pins %s (NVMTL_SURF_TEX_PIN=0 off)", on ? "on" : "off"); }
+    return on;
+}
+// Every caller arrives under the device's @synchronized (newTextureWithDescriptor:iosurface:plane:), the
+// same lock the weak cache relies on; the import cache's own lock covers its tables.
+static NVMTLSurfTexPins *nvmtl_surf_tex_pins(id dev)
+{
+    NVMTLSurfTexPins *pins = objc_getAssociatedObject(dev, &nvmtl_surface_pins_key);
+    if (!pins) { pins = [NVMTLSurfTexPins new];
+        objc_setAssociatedObject(dev, &nvmtl_surface_pins_key, pins, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+    return pins;
+}
 @implementation NVMTLDevice
 @dynamic depth24Stencil8PixelFormatSupported, headless, location, locationNumber, lowPower, maxArgumentBufferSamplerCount, maxTransferRate, peerCount, peerGroupID, peerIndex, registryID, removable, sparseTileSizeInBytes, supportsPlacementSparse;
 + (void)load {
@@ -1677,6 +1718,27 @@ static char nvmtl_surface_cache_key;
             return alias;
         }
     }
+    if (surf && key && nvmtl_surf_tex_pins_on()) {
+        // The same surface wrapped again (a frame of the same video ring): a pinned backing exists, and
+        // the cookie still on the surface proves the id was not handed to a different surface. Geometry,
+        // format, options and framebuffer-ness must match what the backing was built for - anything else
+        // falls to the full path below, exactly as the weak-cache case above does.
+        NVMTLSurfTexPins *pins = nvmtl_surf_tex_pins(self);
+        NSNumber *sidN = @(IOSurfaceGetID(surf));
+        NVMTLTexture *pinned = [pins.backing objectForKey:sidN];
+        NSNumber *cookieN = [pins.cookie objectForKey:sidN];
+        if (pinned && cookieN && cookieN.unsignedLongLongValue == nvmtl_ic_cookie_read(surf)
+            && pinned->_fmt == t->_fmt && pinned->_ropt == t->_ropt && pinned->_fbo == t->_fbo
+            && pinned->_plane == plane && pinned.width == w && pinned.height == h) {
+            NVMTLTexture *alias = (NVMTLTexture *)[pinned newTextureViewWithPixelFormat:d.pixelFormat];
+            if (alias) {
+                alias->_viewParent = nil; alias->_usage = nvmtl_surface_usage(d.usage, t->_fbo, alias->_stex); alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
+                nvmtl_texture_desc_swizzle(alias, d);
+                [pins.lru removeObject:sidN]; [pins.lru addObject:sidN];   // touched: keep it pinned longest
+                return alias;
+            }
+        }
+    }
     if (nvmtl_surface_image_create(t, surf, plane, (uint32_t)w, (uint32_t)h, vkf, bpp, a8, wantStex)) {
         nvlog("newTextureWithDescriptor:iosurface:plane: image create FAILED (%zux%zu)", w, h); return nil; }
     t->_q = nvmtl_device_queue();
@@ -1687,8 +1749,30 @@ static char nvmtl_surface_cache_key;
     t->_usage = nvmtl_surface_usage(d.usage, t->_fbo, t->_stex);
     nvmtl_texture_desc_swizzle(t, d);
     if (key && !t->_vramOn) [cache setObject:t forKey:key];
-    nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
-          (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);
+    if (key && t->_vramOn && surf && nvmtl_surf_tex_pins_on()) {
+        // Pin only imports the cache owns: those carry a non-zero cookie on the surface (the cache writes
+        // it when the slot is inserted), which both proves the import went through nvmtl_ic_get and gives
+        // the reuse check above its guard. An import the cache skipped (over its byte cap, or off) has no
+        // cookie and must not be pinned - its buffer belongs to this texture alone and an id reused by a
+        // new surface would not be detectable.
+        const uint64_t cookie = nvmtl_ic_cookie_read(surf);
+        if (cookie) {
+            NVMTLSurfTexPins *pins = nvmtl_surf_tex_pins(self);
+            NSNumber *sidN = @(IOSurfaceGetID(surf));
+            [pins.backing removeObjectForKey:sidN]; [pins.cookie removeObjectForKey:sidN]; [pins.lru removeObject:sidN];
+            [pins.lru addObject:sidN];
+            if (pins.lru.count > NVMTL_SURF_TEX_PIN_MAX) {   // releasing the oldest pin releases its import slot
+                NSNumber *old = pins.lru.firstObject;
+                [pins.backing removeObjectForKey:old]; [pins.cookie removeObjectForKey:old];
+                [pins.lru removeObjectAtIndex:0];
+            }
+            [pins.backing setObject:t forKey:sidN]; [pins.cookie setObject:@(cookie) forKey:sidN];
+        }
+    }
+    { static _Atomic uint64_t wrapped; const uint64_t k = atomic_fetch_add(&wrapped, 1);
+      if (k < 8 || k % 4096 == 0)   // every frame of a video re-wraps: the first few and one in 4096 suffice
+        nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
+              (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat); }
     return t; }
 
 - (id<MTLLibrary>)nvmtlNewLibraryWithSPIRV:(NSDictionary<NSString *, NSData *> *)fns {

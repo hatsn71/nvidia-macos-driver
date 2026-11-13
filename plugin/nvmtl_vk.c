@@ -11060,6 +11060,36 @@ int nvmtl_vk_image_create_buffer_alias(uint32_t w, uint32_t h, uint32_t vkfmt, u
     else { nvmtl_commit_image(&pending); *out = pending; }
     return result;
 }
+// A buffer-alias image is built for every wrap of a family-VRAM surface - a video surface is rewrapped
+// per frame - and every build used to resolve three instance procs by name and ask the driver the
+// format properties of the same handful of formats again and again. The answers never change for a
+// live instance, so both are cached here. The table is small and linear-scanned: the formats of one
+// buffer alias group are few, and a hit costs less than the call it saves.
+#include <os/lock.h>
+static os_unfair_lock g_alias_fmt_lock = OS_UNFAIR_LOCK_INIT;
+static PFN_vkGetPhysicalDeviceFormatProperties g_alias_gfp;
+static PFN_vkGetPhysicalDeviceImageFormatProperties2 g_alias_gif;
+static PFN_vkGetImageSubresourceLayout g_alias_gsl;
+enum { NVMTL_ALIAS_FP_CACHE = 64 };
+static struct { uint32_t fmt; VkFormatProperties fp; } g_alias_fp[NVMTL_ALIAS_FP_CACHE];
+static VkFormatProperties nvmtl_alias_format_properties(uint32_t fmt)
+{
+    os_unfair_lock_lock(&g_alias_fmt_lock);
+    for (unsigned i = 0; i < NVMTL_ALIAS_FP_CACHE; i++)
+        if (g_alias_fp[i].fmt == fmt) { const VkFormatProperties hit = g_alias_fp[i].fp; os_unfair_lock_unlock(&g_alias_fmt_lock); return hit; }
+    os_unfair_lock_unlock(&g_alias_fmt_lock);
+    if (!g_alias_gfp) g_alias_gfp = (PFN_vkGetPhysicalDeviceFormatProperties)pvkGetInstanceProcAddr(g_inst, "vkGetPhysicalDeviceFormatProperties");
+    VkFormatProperties fp; memset(&fp, 0, sizeof fp);
+    if (g_alias_gfp) g_alias_gfp(g_pdev, (VkFormat)fmt, &fp);
+    os_unfair_lock_lock(&g_alias_fmt_lock);
+    for (unsigned i = 0; i < NVMTL_ALIAS_FP_CACHE; i++) {
+        if (!g_alias_fp[i].fmt || g_alias_fp[i].fmt == fmt) {   // an empty slot, or a racer filled it first
+            g_alias_fp[i].fmt = fmt; g_alias_fp[i].fp = fp; break;
+        }
+    }
+    os_unfair_lock_unlock(&g_alias_fmt_lock);
+    return fp;
+}
 static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, int storage, int render,
                                        const nvk_buffer *b, size_t offset, size_t row_pitch, nvk_image *out)
 {
@@ -11073,10 +11103,8 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
         nvlog("buffer texture: bytesPerRow %zu is not a multiple of 32 B (the texture header's linear pitch unit)", row_pitch); return -1; }
     if (offset > b->size || (size_t)row_pitch * (h - 1) + (size_t)w * bpp > b->size - offset) {
         nvlog("buffer texture: %ux%u at offset %zu pitch %zu overruns the %zu-byte buffer", w, h, offset, row_pitch, b->size); return -1; }
-    PFN_vkGetPhysicalDeviceFormatProperties gfp = (PFN_vkGetPhysicalDeviceFormatProperties)pvkGetInstanceProcAddr(g_inst, "vkGetPhysicalDeviceFormatProperties");
-    VkFormatProperties fp; memset(&fp, 0, sizeof fp);
-    if (gfp) gfp(g_pdev, (VkFormat)vkfmt, &fp);
-    VkFormatFeatureFlags lf = fp.linearTilingFeatures;
+    const VkFormatProperties fp = nvmtl_alias_format_properties(vkfmt);
+    const VkFormatFeatureFlags lf = fp.linearTilingFeatures;
     if (!(lf & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) { nvlog("buffer texture: VkFormat %u cannot be sampled LINEAR (features 0x%x)", vkfmt, (unsigned)lf); return -1; }
     int wantS = storage, wantR = render;
     storage = storage && !a8 && (lf & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
@@ -11107,8 +11135,7 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
         const VkFormatFeatureFlags need = nvmtl_vk_usage_features(ici.usage);
         int self_listed = 0;
         for (uint32_t i = 0; i < vtbln && nlist < (uint32_t)(sizeof vlist / sizeof *vlist); i++) {
-            VkFormatProperties pp; memset(&pp, 0, sizeof pp);
-            if (gfp) gfp(g_pdev, vtbl[i], &pp);
+            const VkFormatProperties pp = nvmtl_alias_format_properties(vtbl[i]);
             if ((pp.linearTilingFeatures & need) != need) continue;
             if ((uint32_t)vtbl[i] == vkfmt) self_listed = 1;
             vlist[nlist++] = vtbl[i];
@@ -11124,7 +11151,7 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
         }
     }
     if (nlist) {
-        PFN_vkGetPhysicalDeviceImageFormatProperties2 gif = (PFN_vkGetPhysicalDeviceImageFormatProperties2)
+        if (!g_alias_gif) g_alias_gif = (PFN_vkGetPhysicalDeviceImageFormatProperties2)
             pvkGetInstanceProcAddr(g_inst, "vkGetPhysicalDeviceImageFormatProperties2");
         VkImageFormatListCreateInfo qfl = { VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, NULL, nlist, vlist };
         VkPhysicalDeviceImageDrmFormatModifierInfoEXT qmi = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT, &qfl,
@@ -11132,19 +11159,19 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
         VkPhysicalDeviceImageFormatInfo2 qi = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, g_linmod ? (void *)&qmi : (void *)&qfl,
             ici.format, ici.imageType, ici.tiling, ici.usage, VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT };
         VkImageFormatProperties2 qo; memset(&qo, 0, sizeof qo); qo.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
-        VkResult qr = gif ? gif(g_pdev, &qi, &qo) : VK_ERROR_EXTENSION_NOT_PRESENT;
+        VkResult qr = g_alias_gif ? g_alias_gif(g_pdev, &qi, &qo) : VK_ERROR_EXTENSION_NOT_PRESENT;
         if (qr == VK_SUCCESS) { ici.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT; fl.viewFormatCount = nlist; ici.pNext = &fl; }
         else { nvlog("buffer texture: VkFormat %u stays single-format - a mutable image over its %u same-size format(s) is refused (VkResult %d%s)",
-                     vkfmt, nlist, (int)qr, gif ? "" : ", no vkGetPhysicalDeviceImageFormatProperties2"); vmask = 0; nlist = 0; }
+                     vkfmt, nlist, (int)qr, g_alias_gif ? "" : ", no vkGetPhysicalDeviceImageFormatProperties2"); vmask = 0; nlist = 0; }
     }
     VKCK(nvmtl_opaque_CreateImage(g_dev, &ici, NULL, &out->img), "vkCreateImage(buffer texture)");
     out->layout = VK_IMAGE_LAYOUT_PREINITIALIZED;
     out->vkflags = (uint32_t)ici.flags; out->usage = (uint32_t)ici.usage; out->vfl = vmask;
     if (!g_linmod) {
-        PFN_vkGetImageSubresourceLayout gsl = (PFN_vkGetImageSubresourceLayout)pvkGetInstanceProcAddr(g_inst, "vkGetImageSubresourceLayout");
+        if (!g_alias_gsl) g_alias_gsl = (PFN_vkGetImageSubresourceLayout)pvkGetInstanceProcAddr(g_inst, "vkGetImageSubresourceLayout");
         VkImageSubresource sr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 }; VkSubresourceLayout got; memset(&got, 0, sizeof got);
-        if (gsl) gsl(g_dev, (VkImage)out->img, &sr, &got);
-        if (!gsl || got.rowPitch != row_pitch || got.offset) {
+        if (g_alias_gsl) g_alias_gsl(g_dev, (VkImage)out->img, &sr, &got);
+        if (!g_alias_gsl || got.rowPitch != row_pitch || got.offset) {
             nvlog("buffer texture: LINEAR tiling picked pitch %llu offset %llu, the app's bytesPerRow is %zu - refused",
                   (unsigned long long)got.rowPitch, (unsigned long long)got.offset, row_pitch);
             pvkDestroyImage(g_dev, (VkImage)out->img, NULL); memset(out, 0, sizeof *out); return -1; }
@@ -11169,8 +11196,12 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
         (VkFormat)vkfmt, swz, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
     VKCK(nvmtl_opaque_CreateImageView(g_dev, &vci, NULL, &out->view), "vkCreateImageView(buffer texture)");
 
-    nvlog("buffer texture: %ux%u VkFormat %u pitch %zu bound at %zu (%s, align %llu, size %llu, storage %d, render %d, view formats 0x%x)", w, h, vkfmt, row_pitch, at,
-          g_linmod ? "DRM linear" : "LINEAR", (unsigned long long)mr.alignment, (unsigned long long)mr.size, storage, render, out->vfl);
+    // A video surface builds one of these per frame; the first few lines tell a reader everything the
+    // per-wrap repeat would, and one in 4096 keeps a slow pulse on a long run.
+    { static _Atomic uint64_t built; const uint64_t k = atomic_fetch_add(&built, 1);
+      if (k < 4 || k % 4096 == 0)
+        nvlog("buffer texture: %ux%u VkFormat %u pitch %zu bound at %zu (%s, align %llu, size %llu, storage %d, render %d, view formats 0x%x)", w, h, vkfmt, row_pitch, at,
+              g_linmod ? "DRM linear" : "LINEAR", (unsigned long long)mr.alignment, (unsigned long long)mr.size, storage, render, out->vfl); }
     return 0;
 }
 

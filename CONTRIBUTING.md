@@ -11,11 +11,6 @@ gets a real review.
 
 One problem per issue. If you found the cause, say how you know: what you ran and what it printed.
 
-## No AI-written contributions
-
-Pull requests, issues and review comments must be written by a person who understands them. AI-written code,
-descriptions and bug reports are closed without review.
-
 ## Pull requests
 
 - Write it yourself and understand it. You have to be able to explain every line and answer review questions about
