@@ -329,7 +329,7 @@ NV_STATUS NV_API_CALL os_pci_write_dword(void *h, NvU32 off, NvU32 v) { NV_XNU_T
 
 struct nv_xnu_map { IOMemoryDescriptor *md; IOMemoryMap *map; void *va; NvU64 phys; NvU64 size; void *alias; };
 extern "C" { void *nv_pm_alias(NvU64, NvU64, void **); void nv_pm_alias_drop(void *); bool nv_pm_is_gpu(NvU64, NvU64);
-             void nv_pm_foreign(NvU64, NvU64, NvU32, void *); }
+             void nv_pm_foreign(NvU64, NvU64, NvU32, void *); bool nv_xnu_chat(void); }
 // Every kernel mapping RM makes is tracked here (VA -> physical for the framebuffer's overlap and aperture checks).
 // WAS 1024: a resizable BAR1 has a 4 GB surface budget and the accelerator maps each allocation, so an RTX 3050 and
 // an RTX 5070 filled the table after ~20 minutes; every later surface then had no physical address and was refused.
@@ -358,7 +358,9 @@ static inline void nv_xnu_map_publish(nv_xnu_map *m, IOMemoryDescriptor *md, IOM
 void *NV_API_CALL os_map_kernel_space(NvU64 start, NvU64 size, NvU32 mode)
 {
     IOOptionBits cache = (mode == NV_MEMORY_CACHED) ? kIOMapDefaultCache : (mode == NV_MEMORY_WRITECOMBINED ? kIOMapWriteCombineCache : kIOMapInhibitCache);
-    kprintf("NVRM-xnu: >os_map_kernel_space start=0x%llx size=0x%llx mode=%u\n", start, size, mode);
+    // Per-mapping lines were 59% of this driver's kernel log on a desktop session (9,546 lines in 24 minutes): the
+    // request line now shares the start-up chat budget, and the result line prints only when the table grows.
+    if (nv_xnu_chat()) kprintf("NVRM-xnu: >os_map_kernel_space start=0x%llx size=0x%llx mode=%u\n", start, size, mode);
     if (!nv_pm_is_gpu(start, size)) {
         void *cookie = NULL; void *ava = nv_pm_alias(start, size, &cookie);
         if (ava) {
@@ -382,11 +384,14 @@ void *NV_API_CALL os_map_kernel_space(NvU64 start, NvU64 size, NvU32 mode)
     IOLockLock(nv_xnu_maps_lock);
     for (int i = 0; i < NV_XNU_MAX_MAPS; i++) if (nv_xnu_maps[i].va == NULL) {
         nv_xnu_map_publish(&nv_xnu_maps[i], md, map, va, start, size, NULL);
-        if ((unsigned)i + 1 > nv_xnu_maps_high) nv_xnu_maps_high = (unsigned)i + 1;
+        const bool grew = (unsigned)i + 1 > nv_xnu_maps_high;
+        if (grew) nv_xnu_maps_high = (unsigned)i + 1;
         const unsigned high = nv_xnu_maps_high;
         IOLockUnlock(nv_xnu_maps_lock);
-        kprintf("NVRM-xnu:   mapped -> 0x%llx (slot %d, high water %u/%u)\n",
-                (unsigned long long)(uintptr_t)va, i, high, (unsigned)NV_XNU_MAX_MAPS);
+        // A new high-water mark is the line field reports need (how full the table gets); it can print at most
+        // NV_XNU_MAX_MAPS times in a boot.
+        if (grew) kprintf("NVRM-xnu:   mapped 0x%llx+0x%llx -> 0x%llx (slot %d, high water %u/%u)\n", start, size,
+                          (unsigned long long)(uintptr_t)va, i, high, (unsigned)NV_XNU_MAX_MAPS);
         return va;
     }
     IOLockUnlock(nv_xnu_maps_lock);

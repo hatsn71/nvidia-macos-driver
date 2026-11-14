@@ -1947,7 +1947,9 @@ IOReturn NVRM::go(uint32_t pass)
 bool NVRM::interruptFilter(IOFilterInterruptEventSource *src)
 {
     unsigned long n = ++gNvIsrCount;
-    if (n <= 3 || (n % 1000) == 0) kprintf("NVRM-xnu: MSI #%lu -> work loop (handled so far %lu)\n", n, gNvIsrHandled);
+    // Primary interrupt context: only the first three print. The every-1000th line cost a kprintf here and none of
+    // them reached the kernel log.
+    if (n <= 3) kprintf("NVRM-xnu: MSI #%lu -> work loop (handled so far %lu)\n", n, gNvIsrHandled);
     return true;
 }
 void NVRM::interruptOccurred(IOInterruptEventSource *src, int count)
@@ -2697,7 +2699,7 @@ IOReturn NVRMUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
             md = IOMemoryDescriptor::withOptions(r, (UInt32)n, 0, NULL, kIOMemoryTypePhysical64 | kIODirectionInOut);
             kern_os_free(r);
         }
-        kprintf("NVRM-xnu: map fd %d: device %llu range(s) first 0x%llx+0x%llx caching %u\n", fFd, n, c->memArea.pRanges[0].start, c->memArea.pRanges[0].size, caching);
+        if (nv_xnu_chat()) kprintf("NVRM-xnu: map fd %d: device %llu range(s) first 0x%llx+0x%llx caching %u\n", fFd, n, c->memArea.pRanges[0].start, c->memArea.pRanges[0].size, caching);
     }
     if (!md) return kIOReturnNoMemory;
     IOOptionBits add = 0;
@@ -2818,7 +2820,9 @@ extern "C" void NV_API_CALL nv_post_event(nv_event_t *event, NvHandle hEvent, Nv
     if (k == 999 || k == 99999 || k == 999999)
         OSReportWithBacktrace("NVRM-xnu: post #%lld caller chain (nv_post_event at %p, isr-thread %d)", (long long)k + 1,
                               (void *)&nv_post_event, current_thread() == nv_xnu_isr_thread);
-    if (k < 4 || ((k + 1) & 0x3FFF) == 0)
+    // One device event exists per NVK device and every graphics completion posts to all of them, so this counter
+    // moves ~10,000 times a second on a desktop; every 16,384th was about one line a second.
+    if (k < 4 || ((k + 1) & 0xFFFFF) == 0)
         kprintf("NVRM-xnu: nv_post_event #%lld hEvent 0x%x index %u -> %s | matched %lld, waits %lld, slept %lld\n",
                 (long long)k + 1, hEvent, index, c ? "connection woken" : "no connection", (long long)gNvEvtMatched,
                 (long long)gNvEvtWaits, (long long)gNvEvtSlept);
