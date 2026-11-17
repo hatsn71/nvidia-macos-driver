@@ -514,6 +514,13 @@ static OSStatus set_output(DState *s, VTVideoDecoderSession session, CMVideoForm
             CFNumberRef w2 = CFNumberCreate(NULL, kCFNumberIntType, &s->w), h2 = CFNumberCreate(NULL, kCFNumberIntType, &s->h);
             CFDictionarySetValue(m, kCVPixelBufferWidthKey, w2); CFDictionarySetValue(m, kCVPixelBufferHeightKey, h2);
             CFRelease(w2); CFRelease(h2);
+            // Always IOSurface-backed, as the session's pool above and every hardware decoder of Apple's: Chromium asks
+            // for a pixel format and nothing else, a pool made from that alone hands out malloc'd buffers, and its GPU
+            // process stops on CHECK(io_surface) for the first frame (Chrome, Brave: the window blanks on every video).
+            if (!CFDictionaryContainsKey(m, kCVPixelBufferIOSurfacePropertiesKey)) {
+                CFDictionaryRef e = CFDictionaryCreate(NULL, NULL, NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+                CFDictionarySetValue(m, kCVPixelBufferIOSurfacePropertiesKey, e); CFRelease(e);
+            }
             CVPixelBufferPoolRef pool = NULL;
             if (CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL, m, &pool) == kCVReturnSuccess && pool) s->ownPool = pool;
             else if (pool) CVPixelBufferPoolRelease(pool);
@@ -553,6 +560,10 @@ static OSStatus output_buffer(DState *s, unsigned w, unsigned h, CVPixelBufferRe
     CFMutableDictionaryRef a = pa ? CFDictionaryCreateMutableCopy(NULL, 0, pa)
                                   : CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     CFDictionaryRemoveValue(a, kCVPixelBufferWidthKey); CFDictionaryRemoveValue(a, kCVPixelBufferHeightKey);
+    if (!CFDictionaryContainsKey(a, kCVPixelBufferIOSurfacePropertiesKey)) {   // no pool to copy from: still an IOSurface
+        CFDictionaryRef e = CFDictionaryCreate(NULL, NULL, NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        CFDictionarySetValue(a, kCVPixelBufferIOSurfacePropertiesKey, e); CFRelease(e);
+    }
     const OSStatus r = CVPixelBufferCreate(NULL, w, h, s->pf, a, pb);
     CFRelease(a);
     return r;
